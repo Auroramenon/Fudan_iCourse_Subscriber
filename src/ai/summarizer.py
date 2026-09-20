@@ -1,5 +1,4 @@
 """LLM-based course lecture summarization via ModelScope API."""
-
 import time
 
 from openai import OpenAI
@@ -84,14 +83,20 @@ class Summarizer:
                 "Set at least one provider's API key (e.g. DASHSCOPE_API_KEY)."
             )
         self._clients = {
-            p["name"]: OpenAI(api_key=p["api_key"], base_url=p["base_url"])
+            p["name"]: OpenAI(api_key=p["api_key"], base_url=p["base_url"],
+                              max_retries=1)
             for p in self.providers
         }
 
     def _call_llm(self, client: OpenAI, model: str,
                   title: str, content: str) -> str:
+        """流式调用：timeout 只约束两个数据块之间的间隔，而不是整次生成的总耗时。
+
+        思考型模型（DeepSeek-V4.1-Flash 等）一次要跑好几分钟，非流式必然撞上
+        超时。reasoning_content 单独成流，不会混进正文。
+        """
         t0 = time.time()
-        response = client.chat.completions.create(
+        kwargs = dict(
             model=model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -102,32 +107,58 @@ class Summarizer:
                     "content": f"以下是课程《{title}》的录音文本，根据长度，你应该输出的字符数大约为{len(content) // 7}字，请开始总结：\n\n{content}",
                 },
             ],
-            # temperature=0.3,
-            timeout=180,
+            stream=True,
+            timeout=300,
         )
-        if not response.choices:
-            raise ValueError("API returned empty choices — likely content filter or quota exceeded")
-        result = response.choices[0].message.content
+        try:
+            stream = client.chat.completions.create(
+                **kwargs, stream_options={"include_usage": True}
+            )
+        except Exception:
+            # 个别网关不认 stream_options，退回普通流式（只是拿不到 token 统计）
+            stream = client.chat.completions.create(**kwargs)
+
+        parts: list[str] = []
+        reasoning_chars = 0
+        finish_reason = None
+        usage = None
+        for chunk in stream:
+            if getattr(chunk, "usage", None):
+                usage = chunk.usage
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = getattr(choice, "delta", None)
+            if delta is not None:
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    reasoning_chars += len(reasoning)
+                if delta.content:
+                    parts.append(delta.content)
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+        result = "".join(parts)
+        if not result:
+            raise ValueError(
+                "API returned empty content — likely content filter or quota exceeded"
+            )
+        if finish_reason == "length":
+            # 平台输出上限过低导致笔记被截断：报错以便自动换下一个模型。
+            raise ValueError("output truncated (finish_reason=length)")
+
         elapsed = time.time() - t0
-        # Token usage helps explain run cost — every provider's billing is
-        # token-based, and rate-limit decisions key off prompt size much
-        # more than character count.  Some providers (OpenAI-compatible)
-        # leave usage None on streaming or error paths, so fall back to a
-        # plain "no usage" line so the summary still prints.
-        usage = getattr(response, "usage", None)
+        tokens = ""
         if usage is not None:
-            print(
-                f"[Summarizer] Done ({model}): "
-                f"{len(content)} chars input → {len(result)} chars output"
-                f" in {elapsed:.0f}s "
-                f"(tokens: prompt={getattr(usage,'prompt_tokens','?')}, "
-                f"completion={getattr(usage,'completion_tokens','?')})"
+            tokens = (
+                f" (tokens: prompt={getattr(usage, 'prompt_tokens', '?')}, "
+                f"completion={getattr(usage, 'completion_tokens', '?')})"
             )
-        else:
-            print(
-                f"[Summarizer] Done ({model}): {len(content)} chars input"
-                f" → {len(result)} chars output in {elapsed:.0f}s"
-            )
+        print(
+            f"[Summarizer] Done ({model}): {len(content)} chars input"
+            f" → {len(result)} chars output, reasoning {reasoning_chars} chars,"
+            f" in {elapsed:.0f}s{tokens}"
+        )
         return result
 
     def summarize(self, title: str, content: str) -> tuple[str, str]:
