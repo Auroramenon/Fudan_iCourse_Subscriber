@@ -14,6 +14,8 @@ on:
           - HTML
           - PDF
           - Markdown
+          - Obsidian
+          - Word
         default: 'HTML'
       sub_ids:
         description: "Optional comma-separated lecture sub_ids to filter (default: all summarized lectures)"
@@ -59,6 +61,10 @@ jobs:
           sudo cp assets/MSYHBD.TTC /usr/local/share/fonts/custom/
           sudo cp assets/MSYHL.TTC /usr/local/share/fonts/custom/
           sudo fc-cache -fv
+
+      - name: Install Word dependencies
+        if: inputs.export_type == 'Word'
+        run: pip install pypandoc_binary
 
       - name: Fetch database from data branch
         run: |
@@ -138,6 +144,12 @@ jobs:
               ;;
             "Markdown")
               EXPORT_FLAG="--md"
+              ;;
+            "Obsidian")
+              EXPORT_FLAG="--obsidian"
+              ;;
+            "Word")
+              EXPORT_FLAG="--docx"
               ;;
           esac
           if [ -n "$EXPORT_SUB_IDS" ]; then
