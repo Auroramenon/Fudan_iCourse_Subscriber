@@ -7,6 +7,9 @@ import requests
 from io import BytesIO
 from PIL import Image
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -18,6 +21,7 @@ import markdown
 from pygments.formatters import HtmlFormatter
 
 from src.runtime import config
+from src.api.note_export import build_obsidian_zip
 
 _MD_EXTENSIONS= ["tables", "fenced_code", "nl2br", "sane_lists", "codehilite"]
 
@@ -272,6 +276,32 @@ def _resolve_src(url: str, img_data: bytes | None,
     return url
 
 
+def _obsidian_attachment(courses: "OrderedDict[str, list[dict]]"):
+    """把本封邮件里的课次打成 Obsidian 笔记包（zip 附件）。
+
+    纯本地生成，不调用任何 API。任何异常都只打印警告、返回 None，
+    绝不影响邮件本身的发送。
+    """
+    try:
+        payload = [
+            (course_title, lectures[0].get("teacher", ""), lectures)
+            for course_title, lectures in courses.items()
+        ]
+        data = build_obsidian_zip(payload)
+        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        filename = f"iCourse_Obsidian_{today}.zip"
+        part = MIMEBase("application", "zip", name=filename)
+        part.set_payload(data)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        n_notes = sum(len(lecs) for lecs in courses.values())
+        print(f"[Emailer] Attached {filename}: {n_notes} note(s), {len(data)} bytes")
+        return part
+    except Exception as e:  # noqa: BLE001
+        print(f"[Emailer] Obsidian attachment skipped: {type(e).__name__}: {e}")
+        return None
+
+
 class Emailer:
     """Send course summary emails via QQ SMTP SSL."""
 
@@ -385,16 +415,14 @@ class Emailer:
             + "</body></html>"
         )
 
-        # Build MIME: related > alternative > (plain, html) + image attachments
-        msg = MIMEMultipart("related")
-        msg["Subject"] = subject
-        msg["From"] = formataddr(("iCourse Subscriber", self.sender))
-        msg["To"] = self.receiver
-
+        # Build MIME:
+        #   mixed > [ related > (alternative > (plain, html) + CID images),
+        #             Obsidian 笔记包 zip 附件 ]
+        related = MIMEMultipart("related")
         msg_alt = MIMEMultipart("alternative")
         msg_alt.attach(MIMEText(plain, "plain", "utf-8"))
         msg_alt.attach(MIMEText(html, "html", "utf-8"))
-        msg.attach(msg_alt)
+        related.attach(msg_alt)
 
         # Attach CID images
         for cid, png_data in cid_images.items():
@@ -402,10 +430,20 @@ class Emailer:
             img_part.add_header("Content-ID", f"<{cid}>")
             img_part.add_header("Content-Disposition", "inline",
                                 filename=f"{cid}.png")
-            msg.attach(img_part)
+            related.attach(img_part)
 
         if cid_images:
             print(f"[Emailer] Embedded {len(cid_images)} LaTeX images as CID")
+
+        msg = MIMEMultipart("mixed")
+        msg["Subject"] = subject
+        msg["From"] = formataddr(("iCourse Subscriber", self.sender))
+        msg["To"] = self.receiver
+        msg.attach(related)
+
+        notes_part = _obsidian_attachment(courses)
+        if notes_part is not None:
+            msg.attach(notes_part)
 
         # Retry with exponential backoff
         for attempt in range(3):
