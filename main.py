@@ -197,6 +197,23 @@ def _drive_lectures(client: ICourseClient, db: Database,
             scheduler.audio_downloader.release(sub_id)
 
 
+def _attach_teachers(db: Database, email_items: list) -> None:
+    """给每个邮件条目补上任课教师，写进附件笔记的属性里（查不到就留空）。"""
+    for item in email_items:
+        if item.get("teacher"):
+            continue
+        try:
+            row = db.conn.execute(
+                "SELECT c.teacher FROM lectures l "
+                "JOIN courses c ON c.course_id = l.course_id "
+                "WHERE l.sub_id = ?",
+                (str(item["sub_id"]),),
+            ).fetchone()
+            item["teacher"] = (row[0] if row else "") or ""
+        except Exception:  # noqa: BLE001
+            item["teacher"] = ""
+
+
 def _send_email(emailer: Emailer | None, db: Database, reporter: Reporter,
                 email_items: list) -> None:
     """Append any previously-processed-but-unsent lectures, then send."""
@@ -216,6 +233,7 @@ def _send_email(emailer: Emailer | None, db: Database, reporter: Reporter,
 
     if not (emailer and email_items):
         return
+    _attach_teachers(db, email_items)
     try:
         reporter.email_summary(len(email_items))
         if emailer.send(email_items):
