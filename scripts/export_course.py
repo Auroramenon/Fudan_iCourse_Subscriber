@@ -22,6 +22,7 @@ When multiple course IDs are given:
 """
 
 import argparse
+import datetime
 import os
 import smtplib
 import sys
@@ -39,6 +40,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.runtime import config
 from src.data.database import Database  # noqa: E402
 from src.api.emailer import _EMAIL_CSS, _PYGMENTS_CSS, _md_to_html  # noqa: E402
+from src.api.note_export import build_docx as _build_docx  # noqa: E402
+from src.api.note_export import build_obsidian_zip as _build_obsidian_zip  # noqa: E402
 
 # Override hardcoded pixel dimensions for PDF rendering.
 # WeasyPrint maps CSS px to physical size at 96 DPI, which makes the
@@ -184,6 +187,26 @@ def _safe_filename(title: str) -> str:
     return "".join(c if c.isalnum() or c in " _-" else "_" for c in title)
 
 
+def _send_attachments_email(subject: str,
+                            attachments: list[tuple[bytes, str, str, str]],
+                            body: str = "") -> None:
+    """发送带附件的邮件。attachments: (内容, 文件名, maintype, subtype)。"""
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    msg["From"] = formataddr(("iCourse Subscriber", config.SMTP_EMAIL))
+    msg["To"] = config.RECEIVER_EMAIL
+    if body:
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+    for data, filename, maintype, subtype in attachments:
+        part = MIMEBase(maintype, subtype, name=filename)
+        part.set_payload(data)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        msg.attach(part)
+    with _smtp_connect() as server:
+        server.sendmail(config.SMTP_EMAIL, config.RECEIVER_EMAIL, msg.as_string())
+
+
 def _query_course(db: Database, course_id: str,
                   sub_ids: list[str] | None = None) -> tuple[str, str, list[dict]] | None:
     """Return ``(course_title, teacher, lectures)`` for *course_id*.
@@ -248,6 +271,16 @@ def main():
         "--md",
         action="store_true",
         help="Export as Markdown attachment instead of HTML email (experimental)",
+    )
+    parser.add_argument(
+        "--obsidian",
+        action="store_true",
+        help="Export an Obsidian-ready zip: one note per lecture + course index",
+    )
+    parser.add_argument(
+        "--docx",
+        action="store_true",
+        help="Export Word documents via pandoc (formulas become native Word equations)",
     )
     parser.add_argument(
         "--db", default="data/icourse.db",
@@ -335,6 +368,67 @@ def main():
         total_bytes = sum(len(b) for b, _ in attachments)
         print(f"Sending email with {len(attachments)} MD(s) ({total_bytes} bytes)...")
         _send_md_email(subject, attachments)
+        print(f"[OK] Sent: {subject}")
+
+    elif args.obsidian:
+        # Obsidian 模式：所有课程打成一个 zip，放在一封邮件里
+        courses = []
+        for cid in course_ids:
+            result = _query_course(db, cid, sub_ids=sub_ids)
+            if result is not None:
+                courses.append(result)
+        if not courses:
+            print("No courses with summaries found – nothing to send.")
+            sys.exit(0)
+
+        zip_bytes = _build_obsidian_zip(courses)
+        n_notes = sum(len(lectures) for _, _, lectures in courses)
+        filename = f"iCourse_Obsidian_{datetime.date.today().isoformat()}.zip"
+        subject = "[iCourse Obsidian 笔记导出] " + ", ".join(t for t, _, _ in courses)
+        body = (
+            "附件是 Obsidian 笔记包：解压后把里面的 iCourse 文件夹整个拖进你的 Obsidian 仓库（vault）即可。\n"
+            "每节课一篇笔记，每门课有一个索引页；公式由 Obsidian 直接渲染，不依赖图片。\n"
+            "以后重新导出时，直接覆盖同名文件即可。"
+        )
+        print(f"Sending Obsidian zip: {len(courses)} course(s), {n_notes} note(s), "
+              f"{len(zip_bytes)} bytes...")
+        _send_attachments_email(
+            subject, [(zip_bytes, filename, "application", "zip")], body)
+        print(f"[OK] Sent: {subject}")
+
+    elif args.docx:
+        try:
+            import pypandoc  # noqa: F401, PLC0415
+        except ImportError:
+            print("pypandoc is required for Word export. "
+                  "Install it with: pip install pypandoc_binary")
+            sys.exit(1)
+
+        attachments = []
+        titles = []
+        for cid in course_ids:
+            result = _query_course(db, cid, sub_ids=sub_ids)
+            if result is None:
+                continue
+            course_title, teacher, lectures = result
+            titles.append(course_title)
+            print(f"Generating Word document for {course_title}...")
+            docx_bytes = _build_docx(course_title, teacher, lectures)
+            filename = f"{_safe_filename(course_title)}_笔记.docx"
+            attachments.append((
+                docx_bytes, filename, "application",
+                "vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ))
+            print(f"  Word ready ({len(docx_bytes)} bytes): {filename}")
+        if not attachments:
+            print("No courses with summaries found – nothing to send.")
+            sys.exit(0)
+
+        subject = "[iCourse Word 笔记导出] " + ", ".join(titles)
+        body = ("附件是 Word 版笔记，每门课一个文件。公式是 Word 原生公式，可以直接编辑。\n"
+                "打开后用「视图 → 导航窗格」可以按课次跳转。")
+        print(f"Sending email with {len(attachments)} Word file(s)...")
+        _send_attachments_email(subject, attachments, body)
         print(f"[OK] Sent: {subject}")
 
     else:
