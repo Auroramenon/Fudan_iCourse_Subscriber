@@ -1,4 +1,5 @@
 """LLM-based course lecture summarization via ModelScope API."""
+import re
 import time
 
 from openai import OpenAI
@@ -65,6 +66,18 @@ SYSTEM_PROMPT= r"""你是一个专业的课程助教。你的任务是根据用�
    - 但是，你的总结的组织的主线仍然应该以讲师的讲解为逻辑组织，同时把PPT的信息补充进去。
    - 同时，需要注意的是，由于该平台以屏幕截图的方式记录ppt，因此，尽管我们提供的ocr版本已经尽最大努力进行了清洗，你收到的ppt仍然可能有无关网页、导航栏、桌面或系统页面等无关噪音。这些噪音不应被用于课程内容的总结。
    - 输出仍按之前的格式要求，不要保留时间戳标签，只把这些信息当作上下文辅助理解，不用说哪些来自转写哪些来自ppt，自然地合并录音转写和ppt中的知识，生成高质量笔记。"""
+
+# Some models ignore the prompt and write \( \) / \[ \]. Obsidian only renders
+# $ / $$, so normalise here. The lookbehind keeps LaTeX line breaks like \\[4pt].
+_DISPLAY_MATH = re.compile(r"(?<!\\)\\\[(.+?)(?<!\\)\\\]", re.S)
+_INLINE_MATH = re.compile(r"(?<!\\)\\\((.+?)(?<!\\)\\\)", re.S)
+
+
+def normalize_math_delimiters(text: str) -> str:
+    """Rewrite \\[...\\] as $$...$$ and \\(...\\) as $...$."""
+    text = _DISPLAY_MATH.sub(lambda m: "$$" + m.group(1) + "$$", text)
+    return _INLINE_MATH.sub(lambda m: "$" + m.group(1).strip() + "$", text)
+
 
 class Summarizer:
     """Course lecture summarizer with multi-provider fallback.
@@ -179,7 +192,7 @@ class Summarizer:
                 model_id = f"{provider['name']}/{model}"
                 try:
                     result = self._call_llm(client, model, title, content)
-                    return (result, model_id)
+                    return (normalize_math_delimiters(result), model_id)
                 except Exception as e:
                     print(f"[Summarizer] {model_id} failed: "
                           f"{type(e).__name__}: {e}")
